@@ -6,6 +6,7 @@
 #include <map>
 #include <random>
 #include <vector>
+#include <deque>
 #include <functional>
 #include <chrono>
 
@@ -41,10 +42,11 @@ class progress_monitor
 {
     private:
         std::chrono::_V2::steady_clock::time_point starting_time;
-        std::vector<double> progress; //values between 0 and 1
-        std::vector<unsigned long> times; //in milliseconds and counted since start
+        std::deque<double> progress; //values between 0 and 1
+        std::deque<unsigned long> times; //in milliseconds and counted since start
     public:
-        progress_monitor() { reset(); }
+        unsigned size;
+        progress_monitor(unsigned size = 10) : size(size) { reset(); }
         void reset(); //also resets
         unsigned time_remaining() const; //in milliseconds
         void add_datapoint(double percent_progress);
@@ -54,16 +56,19 @@ class progress_monitor
 class model
 {
     public:
-        typedef unsigned long idx;
+        using idx = unsigned;
+        using real_t = long double;
     private:
-        inline static unsigned lambda_pm;
-        inline static double _lambda;
-        inline static double logw_plus;
-        inline static double logw_minus;
-        inline static double velocity;
-        inline static std::map<std::pair<idx, idx>, double> w_map;
-        inline static std::map<std::pair<idx, idx>, double> logq_map;
-        std::map<std::pair<idx, idx>, double> logr_map;
+        const unsigned lambda_pm = 10;
+        const double approx_tol;
+        const real_t _lambda;
+        const real_t logw_plus;
+        const real_t logw_minus;
+        inline static real_t velocity;
+        inline static real_t gamma0;
+        inline static std::map<idx, std::vector<real_t>> u_map;
+        inline static std::map<std::pair<idx, idx>, real_t> logq_map;
+        std::map<std::pair<idx, idx>, real_t> logr_map;
         void compute_velocity();
         #ifdef PRINT_W_MEMORY
         void print_w_map();
@@ -71,22 +76,27 @@ class model
         #endif
         long _X, _T;
         idx _I, _J;
-        progress_monitor pm_w;
+        progress_monitor pm_u;
         progress_monitor pm_r;
+        void fill_u_row(idx i);
     public:
-        bool approximate_w;
-        long radius_no_approx;
-        unsigned long saving_period;
-        model(unsigned lambda_permille, long T, long X, bool approx_w = false);
-        model(unsigned lambda_permille, long T, bool approx_w = false);
-        double w(idx i, idx j);
-        double logw(idx i, idx j);
-        double logq(idx i, idx j);
-        double logr(idx i, idx j);
-        double logp(idx i, idx j);
-        double pplus(idx i, idx j);
-        inline const double& lambda() const { return _lambda; }
-        inline const double& v() const { return velocity; }
+        inline static std::vector<idx> lower_approx_bound;
+        inline static std::vector<idx> upper_approx_bound;
+        bool approximate_u;
+        const unsigned saving_period;
+        model(long T, long X, unsigned saving_period, double tol = 0.);
+        model(long T, unsigned saving_period, double tol = 0.);
+        void fill_u();
+        void fill_logr();
+        real_t u(idx i, idx j);
+        real_t w(idx i, idx j);
+        real_t logw(idx i, idx j);
+        real_t logq(idx i, idx j);
+        real_t logr(idx i, idx j);
+        real_t logp(idx i, idx j);
+        real_t pplus(idx i, idx j);
+        inline const real_t& lambda() const { return _lambda; }
+        inline const real_t& v() const { return velocity; }
         inline long X() const { return _X; }
         inline long T() const { return _T; }
         inline idx I() const { return _I; }
@@ -96,5 +106,30 @@ class model
         void print(std::function<double(model::idx, model::idx)> field, std::ostream& out, const unsigned& digits = 3, long window_size = 20);
 };
 
+std::string d_to_str(double x, int precision = 2);
+
+template<typename T>
+std::pair<T, T> linear_fit(const std::vector<T>& x, const std::vector<T>& y)
+{
+    auto x_it = x.begin();
+    auto y_it = y.begin();
+    T sum_xy = 0;
+    T sum_xx = 0;
+    T sum_x = 0;
+    T sum_y = 0;
+    unsigned n = x.size();
+    while (y_it != y.end() && x_it != x.end())
+    {
+        sum_xy += *x_it * *y_it;
+        sum_xx += *x_it * *x_it;
+        sum_x += *x_it;
+        sum_y += *y_it;
+        ++y_it;
+        ++x_it;
+    }
+    T k = (sum_xy - sum_x * sum_y / n) / (sum_xx - sum_x * sum_x / n);
+    T d = (sum_y - k * sum_x) / n;
+    return {k,d};
+}
 
 #endif
