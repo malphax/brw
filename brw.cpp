@@ -107,9 +107,14 @@ void u_field::fill_checkpoints(idx T, double tol)
     progress_monitor pm;
     idx output_period = T > 100 ? T / 100 : 1;
 
+    double tol0;
+    if (_lambda_pµ == 0) tol0 = tol; //since in this case u(x,t) doesn't move, the scaling region in both directions should be equally extended.
+    else if (_lambda_pµ == 1) tol0 = 0.; //Here the tolerance does not matter as the rightmost particle moves always right.
+    else tol0 = std::exp(-2*_gamma0*std::sqrt(T));
+
     idx t_max = T - T%_saving_period;
     idx t_min = (u_map.size() == 0) ? 0 : u_map.rbegin()->first + 1;
-    double tol0 = std::exp(-2*_gamma0*std::sqrt(T));
+
     for (idx t = t_min; t != t_max + 1; ++t)
     {
         fill_row(t, tol0, tol, true);
@@ -118,14 +123,17 @@ void u_field::fill_checkpoints(idx T, double tol)
         {
             pm.add_datapoint(t / (double) T);
             std::cout << "\x1B[2J\x1B[H" << "Filling u for lambda = " << d_to_str(_lambda, 6) << " for T = " << T << "\n" << pm << std::endl;
-            std::cout << "Memory usage of u: " << estimate_memory() << " byte" << std::endl;
+            std::cout << "Memory usage of u: " << estimate_memory(true) << " byte" << std::endl;
         }
     }
 }
 
 void u_field::fill_between(idx T1, idx T2, double tol, bool overwrite)
 {
-    double tol0 = std::exp(-2*_gamma0*std::sqrt(T2));
+    double tol0;
+    if (_lambda_pµ == 0) tol0 = tol; //since in this case u(x,t) doesn't move, the scaling region in both directions should be equally extended.
+    else if (_lambda_pµ == 1) tol0 = 0.; //Here the tolerance does not matter as the rightmost particle moves always right.
+    else tol0 = std::exp(-2*_gamma0*std::sqrt(T2));
     for (idx t = T1; t != T2 + 1; ++t) fill_row(t, tol0, tol, overwrite);
 }
 
@@ -203,8 +211,7 @@ void u_field::print(std::ostream& out, unsigned digits, idx window_size)
     {
         for (sidx x = - (sidx) window_size; x != window_size + 1; ++x)
         {
-            int i = (t+x)/2;
-            out << std::setw(digits + 3) << d_to_str(u(t,i), digits);
+            out << std::setw(digits + 3) << d_to_str((*this)(x,t), digits);
         }
         out << "\n" << std::endl;
     }
@@ -214,28 +221,31 @@ void u_field::compute_velocity()
 {
     if (_lambda_pµ == 0)
     {
-        _velocity = 0;
+        _velocity = 0.;
+        _gamma0 = 0.;
         return;
     }
     else if (_lambda_pµ == 1000000U)
     {
-        _velocity = 1;
+        _velocity = 1.;
+        _gamma0 = std::numeric_limits<real_t>::max();
         return;
     }
     real_t gamma1 = sqrt(2.*log(1.+_lambda));
     std::function<real_t(real_t)> f = [this](real_t g){ return g*std::tanh(g)-std::log((1.+_lambda)*std::cosh(g)); };
     std::function<real_t(real_t)> f_prime = [this](real_t g){ return g*(1-std::pow(std::tanh(g),2)); };
-    unsigned int i = 0;
+    unsigned i = 0;
+    unsigned max_steps = 300;
     do
     {
         _gamma0 = gamma1;
         gamma1 = _gamma0 - f(_gamma0) / f_prime(_gamma0);
         ++i;
     }
-    while (std::abs(gamma1 - _gamma0)/_gamma0 > 1e-14 && i != 100);
+    while (std::abs(gamma1 - _gamma0)/_gamma0 > 1e-14 && i != max_steps);
     _velocity = std::log((1.+_lambda)*std::cosh(gamma1)) / gamma1;
     _gamma0 = gamma1;
-    if (i == 100) throw std::domain_error("Newton's method did not reach the required degree of precision within 100 steps.");
+    if (i == 100) throw std::domain_error("Newton's method did not reach the required degree of precision within " + std::to_string(100) + " steps.");
 }
 
 void u_field::fill_row(idx t, double tol0, double tol1, bool overwrite)
@@ -270,6 +280,8 @@ void u_field::fill_row(idx t, double tol0, double tol1, bool overwrite)
             if (lower_approx_bound.size() > t) u_map[t].push_back(new_u); //save u_new iff the lower bound of the exact region has been set.
         }
         //If the program reaches this point, the upper_approximation bound has not been set yet and must be set to its maximum value of t.
+        //In the case that _lambda_pµ == 1, the lower approximation bound will not have been set either.
+        if (lower_approx_bound.size() == t) lower_approx_bound.push_back(t);
         if (upper_approx_bound.size() < lower_approx_bound.size()) upper_approx_bound.push_back(t);
     }
 }

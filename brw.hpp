@@ -86,6 +86,8 @@ class u_field
         unsigned saving_period() const { return _saving_period; }
         double velocity() const { return _velocity; }
         double gamma0() const { return _gamma0; }
+        const std::vector<idx>& lower_scaling_region_bound() const { return lower_approx_bound; }
+        const std::vector<idx>& upper_scaling_region_bound() const { return upper_approx_bound; }
         void print(std::ostream& out, unsigned digits = 3, idx window_size = 20);
     private:
         double _lambda;
