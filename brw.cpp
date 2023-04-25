@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <limits>
+#include <thread>
 
 ///////////////////////////////////////////////// BRW /////////////////////////////////////////////////
 
@@ -85,12 +86,20 @@ std::ostream& operator<<(std::ostream& out, const progress_monitor& pm)
     return out;
 }
 
+//Prints time since last reset.
+std::ostream& operator<<(std::ostream& out, const timer& t)
+{
+    auto time = t.time();
+    out << time / 3600000 << " h " << (time % 3600000) / 60000 << " min " << (time % 60000) / 1000 << " s " << time % 1000 << " ms";
+    return out;
+}
+
 ///////////////////////////////////////////////// u_field /////////////////////////////////////////////////
 
-u_field::u_field(unsigned lambda_pµ, unsigned saving_period) : _lambda_pµ(lambda_pµ), _lambda(lambda_pµ / 1e6), _saving_period(saving_period)
+u_field::u_field(unsigned lambda_pµ, unsigned saving_period) : _lambda_pµ(lambda_pµ), _lambda(lambda_pµ / 1e6), _saving_period(saving_period), _nthreads(1)
 {
-    compute_velocity();
     if (lambda_pµ > 1000000) throw std::range_error("Out of range: lambda_pµ must be within [1,1e6].");
+    compute_velocity();
 }
 
 u_field::real_t u_field::operator()(sidx x, idx t) const
@@ -104,13 +113,14 @@ u_field::real_t u_field::operator()(sidx x, idx t) const
 
 void u_field::fill_checkpoints(idx T, double tol)
 {
-    progress_monitor pm;
-    idx output_period = T > 100 ? T / 100 : 1;
+    progress_monitor pm(20);
+    idx output_period = T > 1000 ? 1000 : 1;
+    timer clock;
 
     double tol0;
     if (_lambda_pµ == 0) tol0 = tol; //since in this case u(x,t) doesn't move, the scaling region in both directions should be equally extended.
     else if (_lambda_pµ == 1) tol0 = 0.; //Here the tolerance does not matter as the rightmost particle moves always right.
-    else tol0 = std::exp(-2*_gamma0*std::sqrt(T));
+    else tol0 = std::min(std::exp(-2*_gamma0*std::sqrt(T)), tol);
 
     idx t_max = T - T%_saving_period;
     idx t_min = (u_map.size() == 0) ? 0 : u_map.rbegin()->first + 1;
@@ -118,14 +128,17 @@ void u_field::fill_checkpoints(idx T, double tol)
     for (idx t = t_min; t != t_max + 1; ++t)
     {
         fill_row(t, tol0, tol, true);
-        if ((t - 1) % _saving_period != 0 && t > _saving_period) u_map.erase(t - 1);
+        if ((t - 1) % _saving_period != 0 && t > 0) u_map.erase(t - 1);
         if ((t + 1) % output_period == 0)
         {
-            pm.add_datapoint(t / (double) T);
+            pm.add_datapoint((t - (double) t_min) / (double) t_max);
             std::cout << "\x1B[2J\x1B[H" << "Filling u for lambda = " << d_to_str(_lambda, 6) << " for T = " << T << "\n" << pm << std::endl;
-            std::cout << "Memory usage of u: " << estimate_memory(true) << " byte" << std::endl;
+            std::cout << "Approximate memory usage: " << estimate_memory() / (1 << 20) << " MB" << std::endl;
         }
     }
+    std::cout << "\x1B[2J\x1B[H" << "Filled u for lambda = " << d_to_str(_lambda, 6) << " for T = " << T << std::endl;
+    std::cout << "It took " << clock << "." << std::endl;
+    std::cout << "Approximate memory usage: " << estimate_memory() / (1 << 20) << " MB" << std::endl;
 }
 
 void u_field::fill_between(idx T1, idx T2, double tol, bool overwrite)
@@ -133,23 +146,20 @@ void u_field::fill_between(idx T1, idx T2, double tol, bool overwrite)
     double tol0;
     if (_lambda_pµ == 0) tol0 = tol; //since in this case u(x,t) doesn't move, the scaling region in both directions should be equally extended.
     else if (_lambda_pµ == 1) tol0 = 0.; //Here the tolerance does not matter as the rightmost particle moves always right.
-    else tol0 = std::exp(-2*_gamma0*std::sqrt(T2));
+    else tol0 = std::min(std::exp(-2*_gamma0*std::sqrt(T2)), tol);
     for (idx t = T1; t != T2 + 1; ++t) fill_row(t, tol0, tol, overwrite);
 }
 
 std::ostream& operator<<(std::ostream& out, const u_field& u)
 {
     out << u._lambda_pµ << " " << u._saving_period << std::endl;
-    for (auto& l : u.lower_approx_bound) out << l << " ";
-    out << std::endl;
-    for (auto& up : u.upper_approx_bound) out << up << " ";
-    out << std::endl;
-    for (auto& key_value: u.u_map)
+    for (auto &[key,value]: u.u_map)
     {
-        out << key_value.first << " ";
-        for (auto& val : key_value.second)
+        out << key << " "; //time
+        out << value.first << " "; //lower_scaling_region_bound;
+        for (auto& val : value.second)
         {
-            out << val << " ";
+            out << val << std::hexfloat << " ";
         }
         out << std::endl;
     }
@@ -169,27 +179,16 @@ std::istream& operator>>(std::istream& in, u_field& u)
     u._saving_period = sav_per;
         
     std::string line;
-    if (!(std::getline(in, line))) throw std::runtime_error("Couldn't read in lower_approx_bound.");
-    std::istringstream iss(line);
-    u_field::idx i;
-    u.lower_approx_bound.clear();
-    while (iss >> i) u.lower_approx_bound.push_back(i);
-    
-    if (!(std::getline(in, line))) throw std::runtime_error("Couldn't read in upper_approx_bound.");
-    iss.str(line);
-    iss.clear();
-    u.upper_approx_bound.clear();
-    while (iss >> i) u.upper_approx_bound.push_back(i);
-
-    if(!std::getline(in, line)) throw std::runtime_error("Now values of u to read in.");
+    u.u_map.clear();
+    if(!std::getline(in >> std::ws, line)) throw std::runtime_error("Now values of u to read in.");
     do
     {
-        iss.str(line);
-        iss.clear();
-        u_field::idx t;
-        iss >> t;
-        u_field::real_t value;
-        while (iss >> value) u.u_map[t].push_back(value);
+        std::istringstream iss(line);
+        u_field::idx t, lsrb; //time and lower_scaling_region_bound
+        if (!(iss >> t)) throw std::runtime_error("Couldn't read in timestep.");
+        else if (!(iss >> u.u_map[t].first)) throw std::runtime_error("Couldn't read in lower_approx_bound.");
+        std::string hexvalue;
+        while (iss >> hexvalue) u.u_map[t].second.push_back(std::strtold(hexvalue.c_str(), NULL));
     }
     while (std::getline(in, line));
 
@@ -198,11 +197,17 @@ std::istream& operator>>(std::istream& in, u_field& u)
 
 unsigned long u_field::estimate_memory(bool rough) const
 {
-    if (u_map.size() == 0 || u_map.rbegin()->second.size() == 0) return 0;
-    else if (rough) return (sizeof(idx) + sizeof(real_t) * u_map.rbegin()->second.size()) * u_map.size();
+    if (u_map.size() == 0 || u_map.rbegin()->second.second.size() == 0) return 0;
+    else if (rough) return (2 * sizeof(idx) + sizeof(real_t) * u_map.rbegin()->second.second.size()) * u_map.size() * 2. / 3.;
     unsigned long num_vec_entries = 0;
-    for (const auto& kd : u_map) num_vec_entries += kd.second.size();
-    return sizeof(idx) * u_map.size() + num_vec_entries;
+    for (const auto& kd : u_map) num_vec_entries += kd.second.second.size();
+    return sizeof(idx) * u_map.size() + num_vec_entries * sizeof(real_t);
+}
+
+void u_field::number_of_threads(unsigned n)
+{
+    if (n == 0) throw std::range_error("The number of threads cannot be zero!");
+    _nthreads = n;
 }
 
 void u_field::print(std::ostream& out, unsigned digits, idx window_size)
@@ -250,57 +255,72 @@ void u_field::compute_velocity()
 
 void u_field::fill_row(idx t, double tol0, double tol1, bool overwrite)
 {
-    if (!overwrite && u_map.count(t) != 0) return;
+    if (!overwrite && u_map.count(t) != 0) return; //If overwrite is false and the row has already been filled, do nothing.
     else if (t == 0)
     {
-        if (lower_approx_bound.size() == 0) lower_approx_bound.push_back(0);
-        if (upper_approx_bound.size() == 0) upper_approx_bound.push_back(0);
-        if (u_map.count(t) == 0) u_map[0] = {1.};
+        u_map[0].first = 0; //initializes u_map[0] and creates and empty vector for the u-values.
+    }
+    else if (t == 1)
+    {
+        u_map[1].first = 1;
+        u_map[1].second = std::vector<real_t>{0.5};
     }
     else if (u_map.count(t-1) != 1) throw std::runtime_error("The (t-1)-th row has not been computed yet! t = " + std::to_string(t));
     else
     {
-        real_t new_u;
-        real_t ut1_i;
-        real_t ut1_i1 = 1.;
-        for (idx i = lower_approx_bound[t-1]; i != t + 1; ++i)
+        auto recursion = u_recursion(_lambda);
+        const std::vector<real_t>& prev_u = u_map.at(t-1).second;
+        auto n = prev_u.size();
+
+        std::vector<real_t> temp(n + 1); //the new scaling region can at most be larger by one unit in i (= two units in x)
+        auto beg = prev_u.cbegin();
+        temp.front() = recursion(*beg, 1.); //the previous check for the case t==1 makes sure that *beg and *(end-1) are well-defined
+        temp.back() = recursion(prev_u.back(), 0.);
+        
+        //first and last are indices for moving along u_map[t-1] and must therefore be at most n-1. last will be excluded
+        auto fill = [&beg, &temp, &recursion](unsigned first, unsigned last){ std::transform(beg+first, beg+last, beg+first+1, temp.begin()+first+1, recursion); };
+        
+        auto nthreads = n-1 > 1000*_nthreads ? _nthreads : 1;
+        if (nthreads > 1)
         {
-            ut1_i = u(t-1, i);
-            new_u = (1. + _lambda) / 2. * (ut1_i1 + ut1_i) - _lambda / 2. * (ut1_i1 * ut1_i1 + ut1_i * ut1_i);
-            ut1_i1 = ut1_i; //the future previous value is the present new value
-            if (lower_approx_bound.size() == t && 1. - new_u > tol1)
+            std::vector<std::thread> threads;
+            idx length_per_thread = (n-1) / nthreads;
+            idx remainder = n - 1 - length_per_thread * nthreads;
+            idx i = 0;
+            for (unsigned thread_num = 0; thread_num != nthreads; ++thread_num)
             {
-                lower_approx_bound.push_back(i); //The second condition assures that it is only set once.
+                idx effective_length = length_per_thread + (thread_num < remainder ? 1 : 0); //distribute the remainder over the first (remainder) threads
+                threads.push_back(std::thread(fill, i, i + effective_length));
+                i += effective_length;
             }
-            if (upper_approx_bound.size() == t && new_u <= tol0) //set the upper bound once 
-            {
-                upper_approx_bound.push_back(i != 0 ? i - 1 : 0);
-                return; //Once the upper approximation bound is set, the row is filled.
-            }
-            if (lower_approx_bound.size() > t) u_map[t].push_back(new_u); //save u_new iff the lower bound of the exact region has been set.
+            if (i != n-1) throw std::logic_error("the row was not completely filled");
+            for (auto& thread : threads) thread.join();
         }
-        //If the program reaches this point, the upper_approximation bound has not been set yet and must be set to its maximum value of t.
-        //In the case that _lambda_pµ == 1, the lower approximation bound will not have been set either.
-        if (lower_approx_bound.size() == t) lower_approx_bound.push_back(t);
-        if (upper_approx_bound.size() < lower_approx_bound.size()) upper_approx_bound.push_back(t);
+        else fill(0,n-1);
+
+        //std::transform(beg, u_map.at(t-1).second.cend()-1, beg+1, temp.begin()+1, recursion);
+
+        auto it_lower = 1. - temp.front() < tol1 ? temp.begin() + 1 : temp.begin(); //if the first candidate is close to 1, skip it
+        auto it_upper = temp.back() < tol0 ? temp.end() - 1 : temp.end(); //if the last candidate is close to 0, leave it out
+        u_map[t].first = u_map.at(t-1).first + (it_lower - temp.begin());
+        u_map[t].second = std::vector<real_t>(it_lower, it_upper);
     }
 }
 
 u_field::real_t u_field::u(idx t, idx i) const
 {
-    if (t == 0 && i == 0 || lower_approx_bound.size() > t && i < lower_approx_bound[t]) return 1.;
-    else if (upper_approx_bound.size() > t && i > upper_approx_bound[t]) return 0.;
+    if (i == 0 || i < lower_scaling_region_bound(t)) return 1.;
+    else if (i >= upper_scaling_region_bound(t)) return 0.;
     else
     {
-        auto it = u_map.find(t);
-        if (it != u_map.end()) return it->second.at(i - lower_approx_bound[t]);
-        auto ut1_i = u(t-1,i);
-        if (i != 0)
-        {
-            auto ut1_i1 = u(t-1,i-1);
-            return (1. + _lambda) / 2. * (ut1_i1 + ut1_i) - _lambda / 2. * (ut1_i1 * ut1_i1 + ut1_i * ut1_i);
-        }
-        else return 1.;
+        return u_map.at(t).second.at(i - lower_scaling_region_bound(t)); //like this, only rows in u that have been filled can be accessed.
+        // auto it = u_map.find(t);
+        // if (it != u_map.end()) return it->second.at(i - lower_approx_bound[t]);
+        // if (i != 0)
+        // {
+        //     return recursion(u(t-1,i), u(t-1,i-1));
+        // }
+        // else return 1.;
     }
 }
 

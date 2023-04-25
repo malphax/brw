@@ -47,10 +47,23 @@ class progress_monitor
     public:
         unsigned size;
         progress_monitor(unsigned size = 10) : size(size) { reset(); }
-        void reset(); //also resets
-        unsigned time_remaining() const; //in milliseconds
+        void reset();
+        //Estimated remaining time in milliseconds
+        unsigned time_remaining() const;
         void add_datapoint(double percent_progress);
         friend std::ostream& operator<<(std::ostream& out, const progress_monitor& pm);
+};
+
+class timer
+{
+    private:
+        std::chrono::_V2::steady_clock::time_point starting_time;
+    public:
+        timer() { reset(); }
+        void reset() {starting_time = std::chrono::steady_clock::now(); }
+        //Returns passed time since last reset or construction in milliseconds.
+        unsigned long long time() const { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-starting_time).count(); }
+        friend std::ostream& operator<<(std::ostream& out, const timer& t);
 };
 
 class u_field
@@ -58,11 +71,12 @@ class u_field
     public:
         using sidx = int; //signed index type
         using idx = unsigned int;
-        using real_t = long double;
+        using real_t = double;
         //This class holds the values of u in the scaling region for a given value of lambda. The saving_period is the distance between two checkpoints.
         u_field(unsigned lambda_pµ, unsigned saving_period = 1);
         //Returns u(x,t) assuming step sizes dx == dt == 1
         real_t operator()(sidx x, idx t) const;
+        const std::vector<real_t>& operator[](idx t) const { return u_map.at(t).second; };
         /*Fills in all checkpoints <= T starting from the last row that is saved. If tol = 0., all non-zero values of u are computed.
         Values for which 1-u < tol or u < exp(-2*gamma0*sqrt(T2)) are not saved.*/
         void fill_checkpoints(idx T, double tol = 0.);
@@ -78,7 +92,7 @@ class u_field
         The remaining lines start with the time index and afterwards the entries of u at this time index.
         Only the values that are saved are outputted.*/
         friend std::ostream& operator<<(std::ostream& out, const u_field& u);
-        //Reads in the object from "in", following the format outputted by operator<<.
+        //Reads in the object from "in", following the format outputted by operator<<. this->u_map gets cleared and overwritten.
         friend std::istream& operator>>(std::istream& in, u_field& u);
         //Output the approximate memory used to save u. If rough == true, it is assumed that all rows contain the same number of elements as the latest row.
         unsigned long estimate_memory(bool rough = true) const;
@@ -86,8 +100,10 @@ class u_field
         unsigned saving_period() const { return _saving_period; }
         double velocity() const { return _velocity; }
         double gamma0() const { return _gamma0; }
-        const std::vector<idx>& lower_scaling_region_bound() const { return lower_approx_bound; }
-        const std::vector<idx>& upper_scaling_region_bound() const { return upper_approx_bound; }
+        unsigned number_of_threads() const { return _nthreads; }
+        void number_of_threads(unsigned n);
+        idx lower_scaling_region_bound(idx t) const { return u_map.at(t).first; }
+        idx upper_scaling_region_bound(idx t) const { return lower_scaling_region_bound(t) + u_map.at(t).second.size(); }
         void print(std::ostream& out, unsigned digits = 3, idx window_size = 20);
     private:
         double _lambda;
@@ -95,17 +111,24 @@ class u_field
         unsigned _saving_period;
         double _velocity;
         double _gamma0;
-        std::map<idx, std::vector<real_t>> u_map;
-        std::vector<idx> lower_approx_bound;
-        std::vector<idx> upper_approx_bound;
+        unsigned _nthreads;
+        std::map<idx, std::pair<idx,std::vector<real_t>>> u_map;
         void compute_velocity();
         /*Fill in row t assuming that row t-1 has already been filled.
         If overwrite == true, the potentially filled row is erased first.
         If overwrite == false, but the row is already filled, nothing happens.
         Values for which 1-u < tol1 or u < tol0 are not saved.*/
         void fill_row(idx t, double tol0 = 0., double tol1 = 0., bool overwrite = false);
-        //Returns u given (t,i)-coordinates.
+        //Returns u given (t,i)-coordinates. Only rows that have been filled beforehand can be accessed.
         real_t u(idx t, idx i) const;
+};
+
+class u_recursion
+{
+        u_field::real_t lambda;
+    public:
+        u_recursion(double lambda) : lambda(lambda) {}
+        u_field::real_t operator()(u_field::real_t ut1i, u_field::real_t ut1i1) const { return (1. + lambda) / 2. * (ut1i1 + ut1i) - lambda / 2. * (ut1i1 * ut1i1 + ut1i * ut1i); };
 };
 
 class model
