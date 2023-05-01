@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <limits>
+#include <iterator>
 
 ///////////////////////////////////////////////// BRW /////////////////////////////////////////////////
 
@@ -118,18 +119,31 @@ void u_field::fill_checkpoints(idx T, double tol)
     idx output_period = T > 1000 ? 1000 : 1;
     timer clock;
 
-    double tol0;
-    if (_lambda_pµ == 0) tol0 = tol; //since in this case u(x,t) doesn't move, the scaling region in both directions should be equally extended.
-    else if (_lambda_pµ == 1) tol0 = 0.; //Here the tolerance does not matter as the rightmost particle moves always right.
-    else tol0 = std::min(std::exp(-2*_gamma0*std::sqrt(T)), tol);
+    unsigned device_size = 2 * std::sqrt(T);
 
     idx t_max = T - T%_saving_period;
     idx t_min = (u_map.size() == 0) ? 0 : u_map.rbegin()->first + 1;
 
+    prev_u = thrust::device_vector<real_t>(device_size, 0.);
+    next_u = thrust::device_vector<real_t>(device_size, 0.);
+
+    if (t_min != 0)
+    {
+        thrust::copy(u_map[t_min-1].second.begin(), u_map[t_min-1].second.end(), prev_u.begin());
+        lsrb = u_map[t_min-1].first;
+    }
+    else
+    {
+        prev_u[0] = 1.;
+        u_map[0].second = prev_u;
+        u_map[0].first = 0;
+        ++t_min;
+        lsrb = 0;
+    }
+
     for (idx t = t_min; t != t_max + 1; ++t)
     {
-        fill_row(t, tol0, tol, true);
-        if ((t - 1) % _saving_period != 0 && t > 0) u_map.erase(t - 1);
+        compute_row(t, tol, t % _saving_period == 0);
         if ((t + 1) % output_period == 0)
         {
             pm.add_datapoint((t - (double) t_min) / (double) t_max);
@@ -144,11 +158,24 @@ void u_field::fill_checkpoints(idx T, double tol)
 
 void u_field::fill_between(idx T1, idx T2, double tol, bool overwrite)
 {
-    double tol0;
-    if (_lambda_pµ == 0) tol0 = tol; //since in this case u(x,t) doesn't move, the scaling region in both directions should be equally extended.
-    else if (_lambda_pµ == 1) tol0 = 0.; //Here the tolerance does not matter as the rightmost particle moves always right.
-    else tol0 = std::min(std::exp(-2*_gamma0*std::sqrt(T2)), tol);
-    for (idx t = T1; t != T2 + 1; ++t) fill_row(t, tol0, tol, overwrite);
+    unsigned device_size = 2 * std::sqrt(T2);
+    prev_u = thrust::device_vector<real_t>(device_size, 0.);
+    next_u = thrust::device_vector<real_t>(device_size, 0.);
+
+    if (T1 != 0)
+    {
+        thrust::copy(u_map[T1-1].second.begin(), u_map[T1-1].second.end(), prev_u.begin());
+        lsrb = u_map[T1-1].first;
+    }
+    else
+    {
+        prev_u[0] = 1.;
+        thrust::copy(prev_u.begin(), prev_u.end(), u_map[0].second.begin());
+        ++T1;
+        lsrb = 1;
+    }
+
+    for (idx t = T1; t != T2 + 1; ++t) compute_row(t, tol, true);
 }
 
 std::ostream& operator<<(std::ostream& out, const u_field& u)
@@ -158,10 +185,8 @@ std::ostream& operator<<(std::ostream& out, const u_field& u)
     {
         out << key << " "; //time
         out << value.first << " "; //lower_scaling_region_bound;
-        for (auto& val : value.second)
-        {
-            out << val << std::hexfloat << " ";
-        }
+        out << std::hexfloat;
+        thrust::copy(value.second.begin(), value.second.end(), std::ostream_iterator<u_field::real_t>(out, " "));
         out << std::endl;
     }
     return out;
@@ -199,7 +224,7 @@ std::istream& operator>>(std::istream& in, u_field& u)
 unsigned long u_field::estimate_memory(bool rough) const
 {
     if (u_map.size() == 0 || u_map.rbegin()->second.second.size() == 0) return 0;
-    else if (rough) return (2 * sizeof(idx) + sizeof(real_t) * u_map.rbegin()->second.second.size()) * u_map.size() * 2. / 3.;
+    else if (rough) return (2 * sizeof(idx) + sizeof(real_t) * u_map.rbegin()->second.second.size()) * u_map.size();
     unsigned long num_vec_entries = 0;
     for (const auto& kd : u_map) num_vec_entries += kd.second.second.size();
     return sizeof(idx) * u_map.size() + num_vec_entries * sizeof(real_t);
@@ -251,80 +276,40 @@ void u_field::compute_velocity()
     while (std::abs(gamma1 - _gamma0)/_gamma0 > 1e-14 && i != max_steps);
     _velocity = std::log((1.+_lambda)*std::cosh(gamma1)) / gamma1;
     _gamma0 = gamma1;
-    if (i == 100) throw std::domain_error("Newton's method did not reach the required degree of precision within " + std::to_string(100) + " steps.");
+    if (i == max_steps) throw std::domain_error("Newton's method did not reach the required degree of precision within " + std::to_string(100) + " steps.");
 }
 
-void u_field::fill_row(idx t, double tol0, double tol1, bool overwrite)
+void u_field::compute_row(idx t, double tol, bool save)
 {
-    if (!overwrite && u_map.count(t) != 0) return; //If overwrite is false and the row has already been filled, do nothing.
-    else if (t == 0)
+    auto recursion = u_recursion(_lambda);
+
+    auto beg = prev_u.cbegin();
+    auto end = prev_u.cend();
+    decltype(next_u.begin()) beg_fill;
+    real_t newfront = recursion(prev_u.front(), 1.);
+    if (1. - newfront < tol)
     {
-        u_map[0].first = 0; //initializes u_map[0] and creates and empty vector for the u-values.
+        ++lsrb;
+        beg_fill = next_u.begin();
+        //next_u.back() = recursion(prev_u.back(), 0.);
     }
-    else if (t == 1)
-    {
-        u_map[1].first = 1;
-        u_map[1].second = std::vector<real_t>{0.5};
-    }
-    else if (u_map.count(t-1) != 1) throw std::runtime_error("The (t-1)-th row has not been computed yet! t = " + std::to_string(t));
     else
     {
-        auto recursion = u_recursion(_lambda);
-        const std::vector<real_t>& prev_u = u_map.at(t-1).second;
-        auto n = prev_u.size();
-        
-        #ifdef GPU_SUPPORT
-        thrust::device_vector<real_t> temp(n - 1);
-        thrust::device_vector<real_t> dev_u(prev_u.cbegin(), prev_u.cend());
-        auto beg = dev_u.cbegin();
-        real_t newfront = recursion(prev_u.front(), 1.); //the previous check for the case t==1 makes sure that *beg and *(end-1) are well-defined
-        real_t newback = recursion(prev_u.back(), 0.);
-        thrust::transform(beg, dev_u.cend()-1, beg + 1, temp.begin(), recursion);
-        u_map.erase(t);
-        if (1. - newfront < tol1) u_map[t].first = u_map.at(t-1).first + 1;
-        else
-        {
-            u_map[t].first = u_map.at(t-1).first;
-            u_map[t].second.push_back(newfront);
-        }
-        thrust::copy(temp.cbegin(), temp.cend(), std::back_insert_iterator(u_map[t].second));
-        if (newback > tol0) u_map[t].second.push_back(newback);
-
-        #else
-        std::vector<real_t> temp(n + 1); //the new scaling region can at most be larger by one unit in i (= two units in x)
-        auto beg = prev_u.cbegin();
-        temp.front() = recursion(*beg, 1.); //the previous check for the case t==1 makes sure that *beg and *(end-1) are well-defined
-        temp.back() = recursion(prev_u.back(), 0.);
-        
-        //first and last are indices for moving along u_map[t-1] and must therefore be at most n-1. last will be excluded
-        auto fill = [&beg, &temp, &recursion](unsigned first, unsigned last){ std::transform(beg+first, beg+last, beg+first+1, temp.begin()+first+1, recursion); };
-        
-        auto nthreads = n-1 > 1000*_nthreads ? _nthreads : 1;
-        if (nthreads > 1)
-        {
-            std::vector<std::thread> threads;
-            idx length_per_thread = (n-1) / nthreads;
-            idx remainder = n - 1 - length_per_thread * nthreads;
-            idx i = 0;
-            for (unsigned thread_num = 0; thread_num != nthreads; ++thread_num)
-            {
-                idx effective_length = length_per_thread + (thread_num < remainder ? 1 : 0); //distribute the remainder over the first (remainder) threads
-                threads.push_back(std::thread(fill, i, i + effective_length));
-                i += effective_length;
-            }
-            if (i != n-1) throw std::logic_error("the row was not completely filled");
-            for (auto& thread : threads) thread.join();
-        }
-        else fill(0,n-1);
-
-        //std::transform(beg, u_map.at(t-1).second.cend()-1, beg+1, temp.begin()+1, recursion);
-
-        auto it_lower = 1. - temp.front() < tol1 ? temp.begin() + 1 : temp.begin(); //if the first candidate is close to 1, skip it
-        auto it_upper = temp.back() < tol0 ? temp.end() - 1 : temp.end(); //if the last candidate is close to 0, leave it out
-        u_map[t].first = u_map.at(t-1).first + (it_lower - temp.begin());
-        u_map[t].second = std::vector<real_t>(it_lower, it_upper);
-        #endif
+        next_u[0] = newfront;
+        beg_fill = next_u.begin() + 1;
+        --end;
     }
+
+    thrust::transform(beg, end-1, beg+1, beg_fill, recursion);
+
+    if (save)
+    {
+        u_map[t].first = lsrb;
+        u_map[t].second = next_u;
+    }
+    
+    //Prepare for next call to compute_row.
+    thrust::swap(prev_u, next_u);
 }
 
 u_field::real_t u_field::u(idx t, idx i) const
@@ -333,7 +318,7 @@ u_field::real_t u_field::u(idx t, idx i) const
     else if (i >= upper_scaling_region_bound(t)) return 0.;
     else
     {
-        return u_map.at(t).second.at(i - lower_scaling_region_bound(t)); //like this, only rows in u that have been filled can be accessed.
+        return u_map.at(t).second[i - lower_scaling_region_bound(t)]; //like this, only rows in u that have been filled can be accessed.
         // auto it = u_map.find(t);
         // if (it != u_map.end()) return it->second.at(i - lower_approx_bound[t]);
         // if (i != 0)

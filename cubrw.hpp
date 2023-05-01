@@ -79,7 +79,6 @@ class u_field
         u_field(unsigned lambda_pµ, unsigned saving_period = 1);
         //Returns u(x,t) assuming step sizes dx == dt == 1
         real_t operator()(sidx x, idx t) const;
-        const std::vector<real_t>& operator[](idx t) const { return u_map.at(t).second; };
         /*Fills in all checkpoints <= T starting from the last row that is saved. If tol = 0., all non-zero values of u are computed.
         Values for which 1-u < tol or u < exp(-2*gamma0*sqrt(T2)) are not saved.*/
         void fill_checkpoints(idx T, double tol = 0.);
@@ -105,6 +104,9 @@ class u_field
         double gamma0() const { return _gamma0; }
         unsigned number_of_threads() const { return _nthreads; }
         void number_of_threads(unsigned n);
+        real_t avg_R (idx t) const { return 2*thrust::reduce(u_map.at(t).second.crbegin(), u_map.at(t).second.crend(), (real_t) lower_scaling_region_bound(t), thrust::plus<real_t>()) - (real_t) t; }
+        auto cbegin(idx t) const { return u_map.at(t).second.cbegin(); }
+        auto cend(idx t) const { return u_map.at(t).second.cend(); }
         idx lower_scaling_region_bound(idx t) const { return u_map.at(t).first; }
         idx upper_scaling_region_bound(idx t) const { return lower_scaling_region_bound(t) + u_map.at(t).second.size(); }
         void print(std::ostream& out, unsigned digits = 3, idx window_size = 20);
@@ -115,13 +117,15 @@ class u_field
         double _velocity;
         double _gamma0;
         unsigned _nthreads;
-        std::map<idx, std::pair<idx,std::vector<real_t>>> u_map;
+        std::map<idx, std::pair<idx,thrust::device_vector<real_t>>> u_map;
+        thrust::device_vector<real_t> prev_u;
+        thrust::device_vector<real_t> next_u;
+        idx lsrb;
         void compute_velocity();
-        /*Fill in row t assuming that row t-1 has already been filled.
-        If overwrite == true, the potentially filled row is erased first.
-        If overwrite == false, but the row is already filled, nothing happens.
-        Values for which 1-u < tol1 or u < tol0 are not saved.*/
-        void fill_row(idx t, double tol0 = 0., double tol1 = 0., bool overwrite = false);
+        /*Compute row t assuming that row t-1 has been computed (i.p. call illegal for t==0).
+        The row is only saved in u_map if save==true. Otherwise it is only temporarily saved until the next call to compute_row.
+        Values for which 1-u < tol are not saved.*/
+        void compute_row(idx t, double tol = 0., bool save = false);
         //Returns u given (t,i)-coordinates. Only rows that have been filled beforehand can be accessed.
         real_t u(idx t, idx i) const;
 };
@@ -132,7 +136,11 @@ class u_recursion
     public:
         u_recursion(double lambda) : lambda(lambda) {}
         __host__ __device__
-        u_field::real_t operator()(u_field::real_t ut1i, u_field::real_t ut1i1) const { return (1. + lambda) / 2. * (ut1i1 + ut1i) - lambda / 2. * (ut1i1 * ut1i1 + ut1i * ut1i); };
+        u_field::real_t operator()(u_field::real_t ut1i, u_field::real_t ut1i1) const {
+            u_field::real_t result = (1. + lambda) / 2. * (ut1i1 + ut1i) - lambda / 2. * (ut1i1 * ut1i1 + ut1i * ut1i);
+            if (result < 1e-320) return 0.;
+            return result;
+        };
 };
 
 class model
