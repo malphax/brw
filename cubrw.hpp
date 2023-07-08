@@ -1,8 +1,6 @@
 #ifndef cuBRW_H
 #define cuBRW_H
 
-//#define PRINT_W_MEMORY
-
 #include <map>
 #include <random>
 #include <vector>
@@ -13,8 +11,25 @@
 #include <fstream>
 #include <initializer_list>
 
-#include "thrust/device_vector.h"
-#include "thrust/host_vector.h"
+#define GPU_SUPPORT
+
+#ifdef GPU_SUPPORT
+    #include "thrust/device_vector.h"
+    #include "thrust/host_vector.h"
+    #define DEV_VEC thrust::device_vector<real_t>
+    #define HOST_VEC thrust::host_vector<real_t>
+    #define COPY thrust::copy
+    #define REDUCE thrust::reduce
+    #define SWAP thrust::swap
+    #define PLUS thrust::plus<real_t>
+#else
+    #define DEV_VEC std::vector<real_t>
+    #define HOST_VEC std::vector<real_t>
+    #define COPY std::copy
+    #define REDUCE std::reduce
+    #define SWAP std::swap
+    #define PLUS std::plus<real_t>
+#endif
 
 class BRW
 {
@@ -113,7 +128,24 @@ class u_field
         u_field(unsigned lambda_pµ, unsigned saving_period = 1);
         /*This class holds the values of u in the scaling region for a given value of lambda. The saving_period is the distance between two checkpoints.
         Using this constructor one also has to pass the x-values of the sites at which the function y(0,x) is non-zero.*/
-        u_field(unsigned lambda_pµ, std::initializer_list<int> x_y0, unsigned saving_period = 1);
+        template<class It>
+        u_field(unsigned lambda_pµ, It x_y0_begin, It x_y0_end, unsigned saving_period = 1) : u_field(lambda_pµ, saving_period)
+        {
+            _compute_y = true;
+            if (x_y0_end-x_y0_begin == 1) throw std::runtime_error("The initializer_list<int> x_y0 must be non-empty if it is provided.");
+            int xmin = *std::min_element(x_y0_begin, x_y0_end);
+            int xmax = *std::max_element(x_y0_begin, x_y0_end);
+            if (xmin <= 0) throw std::domain_error("The sites x at which y(0,x) != 0 must all be strictly positive.");
+            for (auto it = x_y0_begin; it != x_y0_end; ++it)
+            {
+                if (*it % 2 == 0)
+                {
+                    y0.resize(*it/2 + 1);
+                    y0[*it/2] = 1;
+                }
+            }
+        }
+        u_field(unsigned lambda_pµ, std::initializer_list<int> x_y0, unsigned saving_period = 1) : u_field(lambda_pµ, x_y0.begin(), x_y0.end(), saving_period) {}
         //Returns u(x,t) assuming step sizes dx == dt == 1
         real_t operator()(idx t, sidx x) const;
         //Returns y(x,t) assuming step sizes dx == dt == 1
@@ -140,13 +172,23 @@ class u_field
         unsigned saving_period() const { return _saving_period; }
         double velocity() const { return _velocity; }
         double gamma0() const { return _gamma0; }
-        real_t avg_R (idx t) const { return 2*thrust::reduce(u_map.at(t).second.crbegin(), u_map.at(t).second.crend(), (real_t) lower_scaling_region_bound(t), thrust::plus<real_t>()) - (real_t) t; }
+        real_t avg_R (idx t) const { return 2*REDUCE(u_map.at(t).second.crbegin(), u_map.at(t).second.crend(), (real_t) lower_scaling_region_bound(t), PLUS()) - (real_t) t; }
         auto cbegin(idx t) const { return u_map.at(t).second.cbegin(); }
         auto cend(idx t) const { return u_map.at(t).second.cend(); }
         auto cbegin_y(idx t) const { return y_map.at(t).cbegin(); }
         auto cend_y(idx t) const { return y_map.at(t).cend(); }
         //Erases the memory of the rows from inclusively T1 to exclusively T2.
-        void erase(idx T1, idx T2) { for (unsigned t = T1; t != T2; ++t) { u_map.erase(t); y_map.erase(t); } }
+        void erase(idx T1, idx T2) {
+            for (unsigned t = T1; t != T2; ++t)
+            {
+                u_map.erase(t);
+                y_map.erase(t);
+                prss_map.erase(t);
+                plss_map.erase(t);
+                prs2s_map.erase(t);
+                pls2s_map.erase(t);
+            }
+        }
         idx lower_scaling_region_bound(idx t) const { return u_map.at(t).first; }
         idx upper_scaling_region_bound(idx t) const { return lower_scaling_region_bound(t) + u_map.at(t).second.size(); }
         void print(std::ostream& out, unsigned digits = 3, idx window_size = 20);
@@ -157,14 +199,17 @@ class u_field
         unsigned _saving_period;
         double _velocity;
         double _gamma0;
-        std::map<idx, std::pair<idx, thrust::host_vector<real_t>>> u_map;
-        thrust::device_vector<real_t> prev_u;
-        thrust::device_vector<real_t> next_u;
-
-        thrust::host_vector<real_t> y0;
-        std::map<idx, thrust::host_vector<real_t>> y_map;
-        thrust::device_vector<real_t> prev_y;
-        thrust::device_vector<real_t> next_y;
+        std::map<idx, std::pair<idx, HOST_VEC>> u_map;
+        DEV_VEC prev_u;
+        DEV_VEC next_u;
+        std::map<idx, HOST_VEC> y_map;
+        HOST_VEC y0;
+        DEV_VEC prev_y;
+        DEV_VEC next_y;
+        std::map<idx, HOST_VEC> prss_map;
+        std::map<idx, HOST_VEC> plss_map;
+        std::map<idx, HOST_VEC> prs2s_map;
+        std::map<idx, HOST_VEC> pls2s_map;
         idx lsrb;
         void compute_velocity();
         /*Compute row t assuming that row t-1 has been computed (i.p. call illegal for t==0).
@@ -202,6 +247,32 @@ class u_recursion
         };
 };
 
+/*class prob_recursion
+{
+        u_field::real_t lambda;
+    public:
+        u_recursion(double lambda) : lambda(lambda) {}
+
+        __host__ __device__
+        void operator()(u_field::real_t& u, const u_field::real_t& uti, const u_field::real_t& uti1) const {
+            u_field::real_t result = (1. + lambda) / 2. * (uti1 + uti) - lambda / 2. * (uti1 * uti1 + uti * uti);
+            if (result < 1e-320) u = 0.;
+            else u = result;
+        };
+
+        __host__ __device__
+        void operator()(u_field::real_t& u, const u_field::real_t& uti, const u_field::real_t& uti1,
+                        u_field::real_t& y, const u_field::real_t& yti, const u_field::real_t& yti1) const {
+            u_field::real_t u_result = (1. + lambda) / 2. * (uti1 + uti) - lambda / 2. * (uti1 * uti1 + uti * uti);
+            u_field::real_t y_result = ((1. + lambda) / 2. - lambda * uti) * yti + ((1. + lambda) / 2. - lambda * uti1) * yti1
+                                        - lambda / 2. * (yti * yti + yti1 * yti1);
+            if (u_result < 1e-320) u = 0.;
+            else u = u_result;
+            if (y_result < 1e-320) y = 0.;
+            else y = y_result;
+        };
+};*/
+
 template<typename IntType>
 class multinomial_distribution
 {
@@ -233,9 +304,14 @@ class multinomial_distribution
             approximate = true;
         }
         
+        static unsigned n_calls_to_binom_dist;
+
         template<class Generator>
         std::vector<IntType> operator()(Generator& engine);
 };
+
+template<typename IntType>
+unsigned multinomial_distribution<IntType>::n_calls_to_binom_dist = 0;
 
 template<typename IntType>
 template<class Generator>
@@ -246,8 +322,12 @@ std::vector<IntType> multinomial_distribution<IntType>::operator()(Generator& en
     IntType estimated;
     for (auto it = p.begin(); it != p.end(); ++it)
     {
-        if ((estimated = remaining * *it) > threshold) result.push_back(estimated);
-        else result.push_back(std::binomial_distribution<IntType>(remaining, *it)(engine));
+        if (approximate && (estimated = remaining * *it) > threshold) result.push_back(estimated);
+        else
+        {
+            ++n_calls_to_binom_dist;
+            result.push_back(std::binomial_distribution<IntType>(remaining, *it)(engine));
+        }
         remaining -= result.back();
         if (remaining == 0) break;
     }
@@ -259,22 +339,55 @@ std::vector<IntType> multinomial_distribution<IntType>::operator()(Generator& en
 class branching_random_walk
 {
     protected:
-        using ptcl_n = unsigned long;
+        using ptcl_n = double;
         u_field* ptr_u;
-        std::map<int, ptcl_n> n;
-        std::map<int, ptcl_n> n1;
+        std::vector<int> red_locations;
+        std::map<int, ptcl_n> n_yellow;
         int t;
         int X, T;
         std::mt19937 engine;
         void evolve_one_step(unsigned long det_thr);
     public:
-        branching_random_walk(u_field* u_ptr, unsigned random_seed, int X, int T) : ptr_u(u_ptr), engine(random_seed), T(T), X(X), t(0) { n[0] = 1; }
+        branching_random_walk(u_field* u_ptr, unsigned random_seed, int X, int T) : ptr_u(u_ptr), engine(random_seed), T(T), X(X), t(0), red_locations{0} { }
         void evolve(long n_steps = 1, unsigned long det_thr = 1<<20);
-        auto cbegin() const { return n.cbegin(); }
-        auto cend() const { return n.cend(); }
-        auto cbegin1() const { return n1.cbegin(); }
-        auto cend1() const { return n1.cend(); }
+        auto cbegin() const { return red_locations.cbegin(); }
+        auto cend() const { return red_locations.cend(); }
+        auto cbegin_y() const { return n_yellow.cbegin(); }
+        auto cend_y() const { return n_yellow.cend(); }
+        auto size() const { return red_locations.size(); }
+        auto size_y() const { return n_yellow.size(); }
+        auto y_at(int x) const { if (std::map<int, branching_random_walk::ptcl_n>::const_iterator search = n_yellow.find(x); search != n_yellow.end()) return search->second; else return (branching_random_walk::ptcl_n) 0; }
 };
+
+#ifdef GPU_SUPPORT
+class red_orange_brw
+{
+    protected:
+        using ptcl_n = double;
+        u_field* ptr_u;
+        std::vector<int> red_locations;
+        thrust::device_vector<ptcl_n> curr_orange;
+        thrust::device_vector<ptcl_n> next_orange;
+        size_t orange_size;
+        int t;
+        int X, T, Delta;
+        std::mt19937 engine;
+        void evolve_one_step(unsigned long det_thr);
+    public:
+        red_orange_brw(u_field* u_ptr, unsigned random_seed, int X, int T, int Delta) : ptr_u(u_ptr), engine(random_seed), T(T), X(X), t(0), Delta(Delta), red_locations{0} {
+            orange_size = u_ptr->cend(0) - u_ptr->cbegin(0);
+            curr_orange = thrust::device_vector<ptcl_n>(orange_size, 0);
+            next_orange = thrust::device_vector<ptcl_n>(orange_size, 0);
+        }
+        void evolve(long n_steps = 1, unsigned long det_thr = 1<<20) { for (unsigned i = 0; i != n_steps; ++i) { evolve_one_step(det_thr); ++t; } }
+        auto cbegin_r() const { return red_locations.cbegin(); }
+        auto cend_r() const { return red_locations.cend(); }
+        auto cbegin_o() const { return curr_orange.cbegin(); }
+        auto cend_o() const { return curr_orange.cend(); }
+        auto size_r() const { return red_locations.size(); }
+        auto size_o() const { return orange_size; }
+};
+#endif
 
 class model
 {

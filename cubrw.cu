@@ -1,9 +1,9 @@
-#define GPU_SUPPORT
-
 #include "cubrw.hpp"
-#include <thrust/iterator/zip_iterator.h>
-#include <thrust/zip_function.h>
-#include <thrust/for_each.h>
+#ifdef GPU_SUPPORT
+    #include <thrust/iterator/zip_iterator.h>
+    #include <thrust/zip_function.h>
+    #include <thrust/for_each.h>
+#endif
 #include <iomanip>
 #include <stdexcept>
 #include <iostream>
@@ -107,23 +107,6 @@ u_field::u_field(unsigned lambda_pµ, unsigned saving_period) : _lambda_pµ(lamb
     compute_velocity();
 }
 
-u_field::u_field(unsigned lambda_pµ, std::initializer_list<int> x_y0, unsigned saving_period) : u_field(lambda_pµ, saving_period)
-{
-    _compute_y = true;
-    if (x_y0.size() == 0) throw std::runtime_error("The initializer_list<int> x_y0 must be non-empty if it is provided.");
-    int xmin = std::min(x_y0);
-    int xmax = std::max(x_y0);
-    if (xmin <= 0) throw std::domain_error("The sites x at which y(0,x) != 0 must all be strictly positive.");
-    for (auto x : x_y0)
-    {
-        if (x % 2 == 0)
-        {
-            y0.resize(x/2 + 1);
-            y0[x/2] = 1;
-        }
-    }
-}
-
 u_field::real_t u_field::operator()(idx t, sidx x) const
 {
     sidx st = t;
@@ -150,21 +133,21 @@ void u_field::fill_checkpoints(idx T, unsigned device_size, double tol)
     idx t_max = T - T%_saving_period;
     idx t_min = (u_map.size() == 0) ? 0 : u_map.rbegin()->first + 1;
 
-    prev_u = thrust::device_vector<real_t>(device_size, 0.);
-    next_u = thrust::device_vector<real_t>(device_size, 0.);
-    prev_y = thrust::device_vector<real_t>(device_size, 0.);
-    next_y = thrust::device_vector<real_t>(device_size, 0.);
+    prev_u = DEV_VEC(device_size, 0.);
+    next_u = DEV_VEC(device_size, 0.);
+    prev_y = DEV_VEC(device_size, 0.);
+    next_y = DEV_VEC(device_size, 0.);
 
     if (t_min != 0)
     {
 
-        thrust::copy(u_map[t_min-1].second.cbegin(), u_map[t_min-1].second.cend(), prev_u.begin());
-        if (_compute_y) thrust::copy(y_map[t_min-1].cbegin(), y_map[t_min-1].cend(), prev_y.begin());
+        COPY(u_map[t_min-1].second.cbegin(), u_map[t_min-1].second.cend(), prev_u.begin());
+        if (_compute_y) COPY(y_map[t_min-1].cbegin(), y_map[t_min-1].cend(), prev_y.begin());
         lsrb = u_map[t_min-1].first;
     }
     else
     {
-        thrust::copy(y0.cbegin(), y0.cend(), prev_y.begin());
+        COPY(y0.cbegin(), y0.cend(), prev_y.begin());
         y_map[0] = y0;
         prev_u[0] = 1.;
         u_map[0].second = prev_u;
@@ -190,20 +173,20 @@ void u_field::fill_checkpoints(idx T, unsigned device_size, double tol)
 
 void u_field::fill_between(idx T1, idx T2, unsigned device_size, double tol)
 {
-    prev_u = thrust::device_vector<real_t>(device_size, 0.);
-    next_u = thrust::device_vector<real_t>(device_size, 0.);
-    prev_y = thrust::device_vector<real_t>(device_size, 0.);
-    next_y = thrust::device_vector<real_t>(device_size, 0.);
+    prev_u = DEV_VEC(device_size, 0.);
+    next_u = DEV_VEC(device_size, 0.);
+    prev_y = DEV_VEC(device_size, 0.);
+    next_y = DEV_VEC(device_size, 0.);
 
     if (T1 != 0)
     {
-        thrust::copy(u_map[T1-1].second.begin(), u_map[T1-1].second.end(), prev_u.begin());
-        if (_compute_y) thrust::copy(y_map[T1-1].cbegin(), y_map[T1-1].cend(), prev_y.begin());
+        COPY(u_map[T1-1].second.begin(), u_map[T1-1].second.end(), prev_u.begin());
+        if (_compute_y) COPY(y_map[T1-1].cbegin(), y_map[T1-1].cend(), prev_y.begin());
         lsrb = u_map[T1-1].first;
     }
     else
     {
-        thrust::copy(y0.cbegin(), y0.cend(), prev_y.begin());
+        COPY(y0.cbegin(), y0.cend(), prev_y.begin());
         y_map[0] = y0;
         prev_u[0] = 1.;
         u_map[0].second = prev_u;
@@ -223,7 +206,7 @@ std::ostream& operator<<(std::ostream& out, const u_field& u)
         out << key << " "; //time
         out << value.first << " "; //lower_scaling_region_bound;
         out << std::hexfloat;
-        thrust::copy(value.second.begin(), value.second.end(), std::ostream_iterator<u_field::real_t>(out, " "));
+        COPY(value.second.begin(), value.second.end(), std::ostream_iterator<u_field::real_t>(out, " "));
         out << std::endl;
     }
     return out;
@@ -345,17 +328,37 @@ void u_field::compute_row(idx t, double tol, bool save)
         --end_y;
     }
     
-    if (_compute_y)
-        thrust::for_each(thrust::make_zip_iterator(thrust::make_tuple(beg_fill_u, beg_u, beg_u+1, beg_fill_y, beg_y, beg_y+1)),
-                         thrust::make_zip_iterator(thrust::make_tuple(end_fill_u, end_u-1, end_u, end_fill_y, end_y-1, end_y)),
-                         thrust::make_zip_function(recursion));
-    else
-        thrust::for_each(thrust::make_zip_iterator(thrust::make_tuple(beg_fill_u, beg_u, beg_u+1)),
-                         thrust::make_zip_iterator(thrust::make_tuple(end_fill_u, end_u-1, end_u)),
-                         thrust::make_zip_function(recursion));
-    // thrust::for_each(thrust::make_zip_iterator(thrust::make_tuple(beg_fill_y, beg_y, )),
-    //                  thrust::make_zip_iterator(thrust::make_tuple()));
-    // thrust::transform(beg_u, end_u-1, beg_u+1, beg_fill_u, recursion);
+    #ifdef GPU_SUPPORT
+        if (_compute_y)
+            thrust::for_each(thrust::make_zip_iterator(thrust::make_tuple(beg_fill_u, beg_u, beg_u+1, beg_fill_y, beg_y, beg_y+1)),
+                            thrust::make_zip_iterator(thrust::make_tuple(end_fill_u, end_u-1, end_u, end_fill_y, end_y-1, end_y)),
+                            thrust::make_zip_function(recursion));
+        else
+            thrust::for_each(thrust::make_zip_iterator(thrust::make_tuple(beg_fill_u, beg_u, beg_u+1)),
+                            thrust::make_zip_iterator(thrust::make_tuple(end_fill_u, end_u-1, end_u)),
+                            thrust::make_zip_function(recursion));
+    #else
+        auto it_fill_u = beg_fill_u;
+        auto it_u = beg_u;
+        auto it_fill_y = beg_fill_y;
+        auto it_y = beg_y;
+        if (_compute_y)
+            while (it_fill_u != end_fill_u)
+            {
+                recursion(*it_fill_u, *it_u, *(it_u+1), *it_fill_y, *it_y, *(it_y+1));
+                ++it_u;
+                ++it_fill_u;
+                ++it_y;
+                ++it_fill_y;
+            }
+        else 
+            while (it_fill_u != end_fill_u)
+            {
+                recursion(*it_fill_u, *it_u, *(it_u+1));
+                ++it_u;
+                ++it_fill_u;
+            }
+    #endif
 
     if (save && _compute_y)
     {
@@ -370,8 +373,8 @@ void u_field::compute_row(idx t, double tol, bool save)
     }
     
     //Prepare for next call to compute_row.
-    thrust::swap(prev_u, next_u);
-    if (_compute_y) thrust::swap(prev_y, next_y);
+    SWAP(prev_u, next_u);
+    if (_compute_y) SWAP(prev_y, next_y);
 }
 
 u_field::real_t u_field::u_ti(idx t, idx i) const
@@ -460,10 +463,10 @@ u_field::real_t u_field::y_ti(idx t, idx i) const
 
 void branching_random_walk::evolve_one_step(unsigned long det_thr)
 {
-    std::map<int, ptcl_n> new_n;
-    std::map<int, ptcl_n> new_n1;
+    std::vector<int> new_red_locations;
     u_field& u = *ptr_u;
-    for (auto [x,num] : n)
+    std::map<int, ptcl_n> new_n_yellow;
+    for (auto x : red_locations)
     {
         double Utilde_ratio_left = (u(T-t-1, X-x+1) - u(T-t-1, X-x+2)) / (u(T-t, X-x) - u(T-t, X-x+1));
         double Utilde_ratio_right = (u(T-t-1, X-x-1) - u(T-t-1, X-x)) / (u(T-t, X-x) - u(T-t, X-x+1));
@@ -474,20 +477,28 @@ void branching_random_walk::evolve_one_step(unsigned long det_thr)
         double p_r_to_2r_left  = Utilde_ratio_left * u.lambda()/2. * (u(T-t-1, X-x+1) - u(T-t-1, X-x+2));
         double p_r_to_rb_left  = Utilde_ratio_left * u.lambda() * u.y(T-t-1, X-x-1);
         
-        auto gains = multinomial_distribution<ptcl_n>(num, { p_r_to_r_right,
-                                                             p_r_to_2r_right,
-                                                             p_r_to_rb_right,
-                                                             p_r_to_r_left,
-                                                             p_r_to_2r_left,
-                                                             p_r_to_rb_left })(engine);
-        ptcl_n gain_right = gains[0] + 2*gains[1] + gains[2];
-        ptcl_n gain_left = gains[3] + 2*gains[4] + gains[5];
-        if (gain_right != 0) new_n[x+1] += gain_right;
-        if (gain_left != 0) new_n[x-1] += gain_left;
-        if (gains[2] != 0) new_n1[x+1] += gains[2];
-        if (gains[5] != 0) new_n1[x-1] += gains[5];
+        double p = std::uniform_real_distribution<>()(engine);
+        
+        if ((p -= p_r_to_r_right) < 0.) new_red_locations.push_back(x+1);
+        else if ((p -= p_r_to_2r_right) < 0.) {
+            new_red_locations.push_back(x+1);
+            new_red_locations.push_back(x+1);
+        }
+        else if ((p -= p_r_to_rb_right) < 0.) {
+            new_red_locations.push_back(x+1);
+            new_n_yellow[x+1] += 1;
+        }
+        else if ((p -= p_r_to_r_left) < 0.) new_red_locations.push_back(x-1);
+        else if ((p -= p_r_to_2r_left) < 0.) {
+            new_red_locations.push_back(x-1);
+            new_red_locations.push_back(x-1);
+        }
+        else {
+            new_red_locations.push_back(x-1);
+            new_n_yellow[x-1] += 1;
+        }
     }
-    for (auto [x,num] : n1)
+    for (auto [x,num] : n_yellow)
     {
         double p_b_to_b_right  = u.y(T-t-1, X-x-1) / u.y(T-t, X-x) * ((1.+u.lambda())/2. - u.lambda() * (u(T-t-1, X-x-1) + u.y(T-t-1, X-x-1)));
         double p_b_to_2b_right = u.y(T-t-1, X-x-1) * u.y(T-t-1, X-x-1) / u.y(T-t, X-x) * u.lambda()/2.;
@@ -499,17 +510,30 @@ void branching_random_walk::evolve_one_step(unsigned long det_thr)
         // double p_b_to_b_left   = (1.-u.lambda())/2.;
         // double p_b_to_2b_left  = u.lambda()/2.;
 
-        auto gains = multinomial_distribution<ptcl_n>(num, { p_b_to_b_right,
-                                                             p_b_to_2b_right,
-                                                             p_b_to_b_left,
-                                                             p_b_to_2b_left }, det_thr)(engine);
+        std::vector<ptcl_n> gains;
+        if (num >= std::numeric_limits<int>::max())
+        {
+            gains = { num * p_b_to_b_right,
+                      num * p_b_to_2b_right,
+                      num * p_b_to_b_left };
+            gains.push_back(num - gains[0] - gains[1] -gains[2]);
+            std::transform(gains.cbegin(), gains.cend(), gains.begin(), [](ptcl_n x){ return (x < std::numeric_limits<int>::max()) ? int(x) : x; });
+        }
+        else
+        {
+            auto long_gains = multinomial_distribution<int>(num, { p_b_to_b_right,
+                                                                p_b_to_2b_right,
+                                                                p_b_to_b_left,
+                                                                p_b_to_2b_left }, det_thr)(engine);
+            gains = std::vector<ptcl_n>(long_gains.cbegin(), long_gains.cend());
+        }
         ptcl_n gain_right = gains[0] + 2*gains[1];
         ptcl_n gain_left = gains[2] + 2*gains[3];
-        if (gain_right != 0) new_n1[x+1] += gain_right;
-        if (gain_left != 0) new_n1[x-1] += gain_left;
+        if (gain_right != 0) new_n_yellow[x+1] += gain_right;
+        if (gain_left != 0) new_n_yellow[x-1] += gain_left;
     }
-    n = std::move(new_n);
-    n1 = std::move(new_n1);
+    red_locations = std::move(new_red_locations);
+    n_yellow = std::move(new_n_yellow);
 }
 
 void branching_random_walk::evolve(long n_steps, unsigned long det_thr)
@@ -520,6 +544,86 @@ void branching_random_walk::evolve(long n_steps, unsigned long det_thr)
         ++t;
     }
 }
+
+#ifdef GPU_SUPPORT
+void red_orange_brw::evolve_one_step(unsigned long det_thr)
+{
+    std::vector<int> new_red_locations;
+    u_field& u = *ptr_u;
+    next_orange = thrust::device_vector<ptcl_n>(0., orange_size);
+    thrust::device_vector<ptcl_n> u_vec(u.cbegin(t), u.cend(t));
+    for (auto x : red_locations)
+    {
+        double Utilde_ratio_left = (u(T-t-1, X-x+1) - u(T-t-1, X-x+2)) / (u(T-t, X-x) - u(T-t, X-x+1));
+        double Utilde_ratio_right = (u(T-t-1, X-x-1) - u(T-t-1, X-x)) / (u(T-t, X-x) - u(T-t, X-x+1));
+        double p_r_to_r_right  = Utilde_ratio_right * ((1.+u.lambda())/2. - u.lambda() * u(T-t-1, X-x-1-Delta));
+        double p_r_to_2r_right = Utilde_ratio_right * u.lambda()/2. * (u(T-t-1, X-x-1) - u(T-t-1, X-x));
+        double p_r_to_ro_right = Utilde_ratio_right * u.lambda() * (u(T-t-1, X-x+1-Delta) - u(T-t-1, X-x+1));
+        double p_r_to_r_left   = Utilde_ratio_left * ((1.+u.lambda())/2. - u.lambda() * u(T-t-1, X-x+1-Delta));
+        double p_r_to_2r_left  = Utilde_ratio_left * u.lambda()/2. * (u(T-t-1, X-x+1) - u(T-t-1, X-x+2));
+        double p_r_to_ro_left  = Utilde_ratio_left * u.lambda() * (u(T-t-1, X-x-1-Delta) - u(T-t-1, X-x-1));
+        
+        double p = std::uniform_real_distribution<>()(engine);
+        unsigned i = (X - x + T - t) / 2;
+        
+        if ((p -= p_r_to_r_right) < 0.) new_red_locations.push_back(x+1);
+        else if ((p -= p_r_to_2r_right) < 0.) {
+            new_red_locations.push_back(x+1);
+            new_red_locations.push_back(x+1);
+        }
+        else if ((p -= p_r_to_ro_right) < 0.) {
+            new_red_locations.push_back(x+1);
+            next_orange[u.lower_scaling_region_bound(t+1) + i-1] += 1;
+        }
+        else if ((p -= p_r_to_r_left) < 0.) new_red_locations.push_back(x-1);
+        else if ((p -= p_r_to_2r_left) < 0.) {
+            new_red_locations.push_back(x-1);
+            new_red_locations.push_back(x-1);
+        }
+        else {
+            new_red_locations.push_back(x-1);
+            next_orange[u.lower_scaling_region_bound(t+1) + i] += 1;
+        }
+    }
+    red_locations = std::move(new_red_locations);
+
+    /*thrust::transform
+    
+    double p_b_to_b_right  = u.y(T-t-1, X-x-1) / u.y(T-t, X-x) * ((1.+u.lambda())/2. - u.lambda() * (u(T-t-1, X-x-1) + u.y(T-t-1, X-x-1)));
+    double p_b_to_2b_right = u.y(T-t-1, X-x-1) * u.y(T-t-1, X-x-1) / u.y(T-t, X-x) * u.lambda()/2.;
+    double p_b_to_b_left   = u.y(T-t-1, X-x+1) / u.y(T-t, X-x) * ((1.+u.lambda())/2. - u.lambda() * (u(T-t-1, X-x+1) + u.y(T-t-1, X-x+1)));
+    double p_b_to_2b_left  = u.y(T-t-1, X-x+1) * u.y(T-t-1, X-x+1) / u.y(T-t, X-x) * u.lambda()/2.;
+
+    // double p_b_to_b_right  = (1.-u.lambda())/2.;
+    // double p_b_to_2b_right = u.lambda()/2.;
+    // double p_b_to_b_left   = (1.-u.lambda())/2.;
+    // double p_b_to_2b_left  = u.lambda()/2.;
+
+    std::vector<ptcl_n> gains;
+    if (num >= std::numeric_limits<int>::max())
+    {
+        gains = { num * p_b_to_b_right,
+                    num * p_b_to_2b_right,
+                    num * p_b_to_b_left };
+        gains.push_back(num - gains[0] - gains[1] -gains[2]);
+        std::transform(gains.cbegin(), gains.cend(), gains.begin(), [](ptcl_n x){ return (x < std::numeric_limits<int>::max()) ? int(x) : x; });
+    }
+    else
+    {
+        auto long_gains = multinomial_distribution<int>(num, { p_b_to_b_right,
+                                                            p_b_to_2b_right,
+                                                            p_b_to_b_left,
+                                                            p_b_to_2b_left }, det_thr)(engine);
+        gains = std::vector<ptcl_n>(long_gains.cbegin(), long_gains.cend());
+    }
+    ptcl_n gain_right = gains[0] + 2*gains[1];
+    ptcl_n gain_left = gains[2] + 2*gains[3];
+    if (gain_right != 0) new_n_yellow[x+1] += gain_right;
+    if (gain_left != 0) new_n_yellow[x-1] += gain_left;
+    
+    n_yellow = std::move(new_n_yellow);*/
+}
+#endif
 
 ///////////////////////////////////////////////// model /////////////////////////////////////////////////
 
