@@ -13,6 +13,9 @@
 
 namespace brw
 {
+    //! A utility for printing double;
+    std::string d_to_str(double x, int precision);
+
     /////////////////
     ////stopwatch////
     /////////////////
@@ -107,6 +110,7 @@ namespace brw
                 std::ofstream file(filename, std::ios::binary);
                 file << "P6\n" << w << " " << h << "\n255\n";
                 file.write(reinterpret_cast<const char *>(&pixels[0]), pixels.size());
+                file.close();
             }
             /*! @brief Reads the color values of a given pixel.
              * @return RGB color values embedded in type std::array<unsigned char, 3>
@@ -244,8 +248,9 @@ namespace brw
          * This class holds the values of u in the scaling region for a given value of lambda.
          * @param lambda_pµ \f$\lambda\cdot10^6\f$ where λ is the splitting rate
          * @param saving_period the distance between two checkpoints
+         * @param device_size the number of entries that are saved per timestep
          */
-        prob_fields(unsigned lambda_pµ, unsigned saving_period = 1);
+        prob_fields(unsigned lambda_pµ, unsigned saving_period = 1, unsigned device_size = 1000);
 
         /*!
          * @brief Constructs a prob_fields object.
@@ -254,9 +259,10 @@ namespace brw
          * @param x_y0_end end iterator to the x-values of the sites at which the function y(0,x) is non-zero
          * @param lambda_pµ \f$\lambda\cdot10^6\f$ where λ is the splitting rate
          * @param saving_period the distance between two checkpoints
+         * @param device_size the number of entries that are saved per timestep
          */
         template<class It>
-        prob_fields(unsigned lambda_pµ, It x_y0_begin, It x_y0_end, unsigned saving_period = 1) : prob_fields(lambda_pµ, saving_period)
+        prob_fields(unsigned lambda_pµ, It x_y0_begin, It x_y0_end, unsigned saving_period = 1, unsigned device_size = 1000) : prob_fields(lambda_pµ, saving_period, device_size)
         {
             _compute_y = true;
             if (x_y0_end-x_y0_begin == 1) throw std::runtime_error("The initializer_list<int> x_y0 must be non-empty if it is provided.");
@@ -279,8 +285,9 @@ namespace brw
          * @param lambda_pµ \f$\lambda\cdot10^6\f$ where λ is the splitting rate
          * @param x_y0 the x-values of the sites at which the function y(0,x) is non-zero
          * @param saving_period the distance between two checkpoints
+         * @param device_size the number of entries that are saved per timestep
          */
-        prob_fields(unsigned lambda_pµ, std::initializer_list<int> x_y0, unsigned saving_period = 1) : prob_fields(lambda_pµ, x_y0.begin(), x_y0.end(), saving_period) {}
+        prob_fields(unsigned lambda_pµ, std::initializer_list<int> x_y0, unsigned saving_period = 1, unsigned device_size = 1000) : prob_fields(lambda_pµ, x_y0.begin(), x_y0.end(), saving_period, device_size) {}
         
         //! Returns u(t,x) assuming step sizes dx == dt == 1
         real_t u(idx t, sidx x) const;
@@ -291,10 +298,9 @@ namespace brw
         /*!
          * @brief Fill in checkpoints up to T.
          * @param T All checkpoints up to and including time T starting from the last row that is saved.
-         * @param device_size the number of entries that are saved per timestep
          * @param tol tolerance s.t. values of u greater than \f$1-\mathrm{tol}\f$ are not stored
          */
-        void fill_checkpoints(idx T, unsigned device_size, double tol = 1e-5);
+        void fill_checkpoints(idx T, double tol = 1e-5);
 
         /*!
          * @brief Fill all rows from inclusively T1 to exclusively T2.
@@ -302,10 +308,9 @@ namespace brw
          * If T1 != 0, row T1-1 must have been filled beforehand.
          * @param T1 first row to fill
          * @param T2 second row to fill
-         * @param device_size the number of entries that are saved per timestep
          * @param tol tolerance s.t. values of u greater than \f$1-\mathrm{tol}\f$ are discarded
          */
-        void fill_between(idx T1, idx T2, unsigned device_size, double tol = 1e-5);
+        void fill_between(idx T1, idx T2, double tol = 1e-5);
 
         //! @brief Output the approximate memory used to save u.
         unsigned long estimate_memory() const;
@@ -318,9 +323,16 @@ namespace brw
         real_t avg_M (idx t) const { return 2*std::accumulate(u_map.at(t).second.crbegin(), u_map.at(t).second.crend(), (real_t) lower_scaling_region_bound(t)) - (real_t) t; }
         auto cbegin_u(idx t) const { return u_map.at(t).second.cbegin(); }
         auto cend_u(idx t) const { return u_map.at(t).second.cend(); }
-        auto cbegin_y(idx t) const { return y_map.at(t).cbegin(); }
-        auto cend_y(idx t) const { return y_map.at(t).cend(); }
+        auto cbegin_y(idx t) const { 
+            if (!_compute_y) throw std::runtime_error("y has not been computed, please use a different constructor!");
+            return y_map.at(t).cbegin(); }
+        auto cend_y(idx t) const { 
+            if (!_compute_y) throw std::runtime_error("y has not been computed, please use a different constructor!");
+            return y_map.at(t).cend(); }
         //! Erase the memory of the rows from inclusively T1 to exclusively T2.
+        /*! 
+         * Safe for rows that were empty already.
+         */
         void erase(idx T1, idx T2) { for (unsigned t = T1; t != T2; ++t) { u_map.erase(t); y_map.erase(t); } }
         idx lower_scaling_region_bound(idx t) const { return u_map.at(t).first; }
         idx upper_scaling_region_bound(idx t) const { return lower_scaling_region_bound(t) + u_map.at(t).second.size(); }
@@ -331,6 +343,7 @@ namespace brw
         unsigned _saving_period;
         double _velocity;
         double _gamma0;
+        double device_size;
         std::map<idx, std::pair<idx, std::vector<real_t>>> u_map;
         std::vector<real_t> prev_u;
         std::vector<real_t> next_u;
@@ -373,6 +386,9 @@ namespace brw
         real_t u_ti(idx t, idx i) const;
         //! Returns y given (t,i)-coordinates. Only rows that have been filled beforehand can be accessed.
         real_t y_ti(idx t, idx i) const;
+        
+        template<typename RandEng>
+        friend class condBRW;
     };
 
     /*!
@@ -384,10 +400,10 @@ namespace brw
     class condBRW
     {
         private:
-            using ptcl_n = double;
-            prob_fields* ptr_uy;
+            using ptcl_n = double; //!< The type for storing particle numbers
+            const prob_fields& uy;
             std::vector<int> red_locations; //!< There are very few red particles, thus it is easier to save the position of each one.
-            std::vector<ptcl_n> n_yellow; //!< Yellow particle numbers grow exponentially, so we only track the number per site.
+            std::map<int, ptcl_n> n_yellow; //!< Yellow particle numbers grow exponentially, so we only track the number per site.
             int t;
             int X, T;
             RandEng engine;
@@ -398,7 +414,7 @@ namespace brw
              * This function encodes all of the classes dynamics.
              * It determines the rules according to which all particles move and replicate.
              * 
-             * @param det_thr During internal computations, \f$\mathcal{B}(n,p)\f$ distributed random variables are replaced by np \f$np>\texttt{det_thr}\f$.
+             * @param det_thr During internal computations, \f$\mathcal{B}(n,p)\f$ distributed random variables are replaced by \f$np\f$ if \f$np>\texttt{det_thr}\f$.
              */
             void evolve_one_step(unsigned long det_thr);
         public:
@@ -410,18 +426,25 @@ namespace brw
              * @param X the destination of the red particle
              * @param T the number of simulation steps
              */
-            condBRW(prob_fields* uy_ptr, unsigned random_seed, int X, int T) : ptr_uy(uy_ptr), engine(random_seed), T(T), X(X), t(0), red_locations{0} { }
+            condBRW(const prob_fields& uy_ref, unsigned random_seed, int X, int T) : uy(uy_ref), engine(random_seed), T(T), X(X), t(0), red_locations{0} { }
             
             /*!
              * @brief Evolve the system.
              * 
              * Evolve the current state by moving and replicating particles.
-             * During internal computations, \f$\mathcal{B}(n,p)\f$ distributed random variables are replaced by np \f$np>\texttt{det_thr}\f$.
+             * During internal computations, \f$\mathcal{B}(n,p)\f$ distributed random variables are replaced by np \f$np\f$ if \f$np>\texttt{det_thr}\f$.
              *
              * @param n_steps number of steps to evolve
              * @param det_thr threshold for deterministic approximation
              */
-            void evolve(long n_steps = 1, unsigned long det_thr = 1<<20);
+            void evolve(long n_steps = 1, unsigned long det_thr = 1<<20)
+            {
+                for (unsigned i = 0; i != n_steps; ++i)
+                {
+                    evolve_one_step(det_thr);
+                    ++t;
+                }
+            }
             auto cbegin_r() const { return red_locations.cbegin(); }
             auto cend_r() const { return red_locations.cend(); }
             auto cbegin_y() const { return n_yellow.cbegin(); }
@@ -429,11 +452,86 @@ namespace brw
             //! number of red particles; equal to cend_r() - cbegin_r()
             auto n_r() const { return red_locations.size(); }
             //! total number of yellow particles
-            auto n_y() const { return std::accumulate(n_yellow.cbegin(), n_yellow.cend(), 0); }
+            // auto n_y() const { return std::accumulate(n_yellow.cbegin(), n_yellow.cend(), 0); }
 
             //! number of particles at the site \f$x\f$
-            auto y_at(int x) const { if (std::map<int, branching_random_walk::ptcl_n>::const_iterator search = n_yellow.find(x); search != n_yellow.end()) return search->second; else return (branching_random_walk::ptcl_n) 0; }
+            auto y_at(int x) const { if (std::map<int, ptcl_n>::const_iterator search = n_yellow.find(x); search != n_yellow.end()) return search->second; else return (ptcl_n) 0; }
     };
+
+    template<class RandEng>
+    void condBRW<RandEng>::evolve_one_step(unsigned long det_thr)
+    {
+        std::vector<int> new_red_locations;
+        std::map<int, ptcl_n> new_n_yellow;
+        for (auto x : red_locations)
+        {
+            double Utilde_ratio_left = (uy.u(T-t-1, X-x+1) - uy.u(T-t-1, X-x+2)) / (uy.u(T-t, X-x) - uy.u(T-t, X-x+1));
+            double Utilde_ratio_right = (uy.u(T-t-1, X-x-1) - uy.u(T-t-1, X-x)) / (uy.u(T-t, X-x) - uy.u(T-t, X-x+1));
+            double p_r_to_r_right  = Utilde_ratio_right * ((1.+uy.lambda())/2. - uy.lambda() * (uy.u(T-t-1, X-x-1) + uy.y(T-t-1, X-x-1)));
+            double p_r_to_2r_right = Utilde_ratio_right * uy.lambda()/2. * (uy.u(T-t-1, X-x-1) - uy.u(T-t-1, X-x));
+            double p_r_to_rb_right = Utilde_ratio_right * uy.lambda() * uy.y(T-t-1, X-x+1);
+            double p_r_to_r_left   = Utilde_ratio_left * ((1.+uy.lambda())/2. - uy.lambda() * (uy.u(T-t-1, X-x+1) + uy.y(T-t-1, X-x+1)));
+            double p_r_to_2r_left  = Utilde_ratio_left * uy.lambda()/2. * (uy.u(T-t-1, X-x+1) - uy.u(T-t-1, X-x+2));
+            double p_r_to_rb_left  = Utilde_ratio_left * uy.lambda() * uy.y(T-t-1, X-x-1);
+            
+            double p = std::uniform_real_distribution<>()(engine);
+            
+            if ((p -= p_r_to_r_right) < 0.) new_red_locations.push_back(x+1);
+            else if ((p -= p_r_to_2r_right) < 0.) {
+                new_red_locations.push_back(x+1);
+                new_red_locations.push_back(x+1);
+            }
+            else if ((p -= p_r_to_rb_right) < 0.) {
+                new_red_locations.push_back(x+1);
+                new_n_yellow[x+1] += 1;
+            }
+            else if ((p -= p_r_to_r_left) < 0.) new_red_locations.push_back(x-1);
+            else if ((p -= p_r_to_2r_left) < 0.) {
+                new_red_locations.push_back(x-1);
+                new_red_locations.push_back(x-1);
+            }
+            else {
+                new_red_locations.push_back(x-1);
+                new_n_yellow[x-1] += 1;
+            }
+        }
+        for (auto [x,num] : n_yellow)
+        {
+            double p_b_to_b_right  = uy.y(T-t-1, X-x-1) / uy.y(T-t, X-x) * ((1.+uy.lambda())/2. - uy.lambda() * (uy.u(T-t-1, X-x-1) + uy.y(T-t-1, X-x-1)));
+            double p_b_to_2b_right = uy.y(T-t-1, X-x-1) * uy.y(T-t-1, X-x-1) / uy.y(T-t, X-x) * uy.lambda()/2.;
+            double p_b_to_b_left   = uy.y(T-t-1, X-x+1) / uy.y(T-t, X-x) * ((1.+uy.lambda())/2. - uy.lambda() * (uy.u(T-t-1, X-x+1) + uy.y(T-t-1, X-x+1)));
+            double p_b_to_2b_left  = uy.y(T-t-1, X-x+1) * uy.y(T-t-1, X-x+1) / uy.y(T-t, X-x) * uy.lambda()/2.;
+
+            // double p_b_to_b_right  = (1.-u.lambda())/2.;
+            // double p_b_to_2b_right = u.lambda()/2.;
+            // double p_b_to_b_left   = (1.-u.lambda())/2.;
+            // double p_b_to_2b_left  = u.lambda()/2.;
+
+            std::vector<ptcl_n> gains;
+            if (num >= std::numeric_limits<int>::max())
+            {
+                gains = { num * p_b_to_b_right,
+                        num * p_b_to_2b_right,
+                        num * p_b_to_b_left };
+                gains.push_back(num - gains[0] - gains[1] -gains[2]);
+                std::transform(gains.cbegin(), gains.cend(), gains.begin(), [](ptcl_n x){ return (x < std::numeric_limits<int>::max()) ? int(x) : x; });
+            }
+            else
+            {
+                auto long_gains = multinomial_distribution<int>(num, { p_b_to_b_right,
+                                                                    p_b_to_2b_right,
+                                                                    p_b_to_b_left,
+                                                                    p_b_to_2b_left }, det_thr)(engine);
+                gains = std::vector<ptcl_n>(long_gains.cbegin(), long_gains.cend());
+            }
+            ptcl_n gain_right = gains[0] + 2*gains[1];
+            ptcl_n gain_left = gains[2] + 2*gains[3];
+            if (gain_right != 0) new_n_yellow[x+1] += gain_right;
+            if (gain_left != 0) new_n_yellow[x-1] += gain_left;
+        }
+        red_locations = std::move(new_red_locations);
+        n_yellow = std::move(new_n_yellow);
+    }
 }
 
 #endif
